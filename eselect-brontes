@@ -1,0 +1,259 @@
+DESCRIPTION="Manage Brontes Software Installs"
+MAINTAINER="jsbronder@mmm.com"
+SVN_DATE='$DATE: $'
+VERSION="0.0.2"
+
+inherit path-manipulation config
+
+EVPREFIX="${ROOT}/etc/env.d/brontes/"
+INIT_DONE=0
+FORCE=0
+INSTALL=0
+
+find_software_classes() {
+	local classes f
+	for f in ${EVPREFIX}*; do
+		[[ -f ${f} ]] || continue
+		f=${f##*/}
+		[[ "${f}" == "config" ]] && continue
+		classes=(${classes[@]} ${f})
+	done
+	echo ${classes[@]}
+}
+
+is_class() {
+	local classes=( $(find_software_classes) )
+	local i
+	for i in ${classes[@]}; do
+		[ "${1}" == "${i}" ] && return 0
+	done
+	return 1
+}
+
+get_current_class()	{ echo "$(load_config "${EVPREFIX}/config" CURRENT)"; }
+get_class_root()	{ echo "$(load_config "${EVPREFIX}/${1}" ROOT)"; }
+is_current() 		{ [ "$(get_current_class)" == "${1}" ]; }
+
+try_script() {
+	local s
+	local rc=0
+
+	if [ "${2}" == "start" ]; then
+		s="$(load_config "${EVPREFIX}/${1}" START_SCRIPT)";
+	elif [ "${2}" == "stop" ]; then
+		s="$(load_config "${EVPREFIX}/${1}" STOP_SCRIPT)";
+	elif [ "${2}" == "install" ]; then
+		s="$(load_config "${EVPREFIX}/${1}" INSTALL_SCRIPT)";
+	elif [ "${2}" == "remove" ]; then
+		s="$(load_config "${EVPREFIX}/${1}" REMOVE_SCRIPT)";
+	else
+		return 1
+	fi
+	
+	if [ -n "${s}" ]; then
+		if ! ${s}; then
+			rc=1
+			echo "ERROR:  Failed to run \"${s}\""
+		fi
+	fi
+	return ${rc}
+}
+
+init() {
+	[[ ${INIT_DONE} -ne 0 ]] && return 0
+	SYM_DIR="${ROOT}/$(load_config "${EVPREFIX}/config" SYM_DIR)"
+	while [ ${SYM_DIR:$(( ${#SYMDIR} - 1)):1} == "/" ]; do
+		SYM_DIR=${SYM_DIR%/}
+	done
+	if [ -e ${SYM_DIR} -a ! -L ${SYM_DIR} ]; then
+		echo "WARNING:  ${SYM_DIR} is not a symlink"
+		if ! rmdir ${SYM_DIR}; then
+			die "Could not remove ${SYM_DIR}"
+		fi
+	fi
+	INIT_DONE=1
+}
+
+update_symlink() {
+	local class_dir="$(load_config "${EVPREFIX}/${1}" ROOT)"
+	
+	init
+
+	# TODO:  We assume that SYM_DIR and class_dir both have
+	# the same parent directory.
+
+	if [[ ${FORCE} -ne 0 ]]; then
+		ln -snf "${class_dir#/}" "${SYM_DIR}" \
+			|| die "Failed to point ${SYM_DIR} to ${class_dir#/}"
+	else
+		[ -e "${SYM_DIR}" ] \
+			&& die "${SYM_DIR} already exists and --force was not specified"
+		ln -s "${class_dir#/}" "${SYM_DIR}" \
+			|| die "Failed to point ${SYM_DIR} to ${class_dir#/}"
+	fi
+}
+
+
+set_class() {
+	local c=${1}
+  	local class_dir="$(canonicalise ${ROOT}/$(get_class_root ${c}))"
+	if [ "$(get_current_class)" == "${c}" ]; then
+		echo "${c} is already in use."
+		return 0
+	fi
+
+	update_symlink "${c}"
+	if [[ ${INSTALL} -eq 0 ]]; then
+		try_script "${c}" "start" \
+			|| die "Failed to set Brontes implementation ${c} as default"
+	else
+		try_script "${c}" "install" \
+			|| die "Failed to install Brontes implementation ${c} as default"
+	fi
+
+	store_config "${EVPREFIX}/config" CURRENT ${c}	
+}
+
+unset_class() {
+	local c=${1}
+	local class_dir="$(get_class_root ${c})"
+
+	init
+	if [[ ${INSTALL} -eq 0 ]]; then
+		try_script "${c}" "stop" \
+			|| die "Failed to stop Brontes implementation ${c}"
+	else
+		try_script "${c}" "remove" \
+			|| die "Failed to remove Brontes implementation ${c}"
+	fi
+
+	if [ -L ${SYM_DIR} ]; then
+		rm -f ${SYM_DIR} || die "Failed to remove link ${SYM_DIR}"
+	fi
+
+	store_config "${EVPREFIX}/config" CURRENT ""
+}
+
+#
+# List function
+#
+describe_list() { echo "List available Brontes software classes"; }
+do_list() {
+	local classes=( $(find_software_classes) )
+	local i active
+
+	write_list_start "Available Brontes software classes:"
+	if [[ -n "${classes[@]}" ]]; then
+		for (( i=0; i<${#classes[@]}; i++ )); do
+			active=''
+			is_current ${classes[i]} && active=' *'
+			write_numbered_list_entry ${i} "${classes[i]}$(highlight "${active}")"
+		done
+	fi
+}
+
+
+#
+# Set function
+#
+describe_set() { echo "Set the Brontes software class"; }
+describe_set_paramaters() { 
+	echo "[--force|--install] <class>"
+	echo "    --force:		Forcefully set the software class"
+	echo "    --install:	Do not run start/stop scripts"
+}
+do_set() {
+	local class=""
+	local old_class="$(get_current_class)"
+	local a
+
+	for a in $@; do
+		[ "${a}" == "--force" ] && FORCE=1
+		[ "${a}" == "--install" ] && INSTALL=1
+		if is_class ${a}; then
+			class="${a}"
+		fi
+	done
+	
+	[ -z "${class}" ] && die -q "No class specified, and no class currently set."
+	if is_current ${class} && [[ ${FORCE} -eq 0 ]]; then
+		echo "${class} is already set"
+		return 0
+	fi
+	
+	if [ -n "${old_class}" ]; then
+		unset_class "${old_class}" \
+			|| die "Failed to unset old class, ${old_class}"
+	fi
+	
+	set_class "${class}"
+}
+
+
+#
+# Unset function
+#
+describe_set() { echo "Unset a Brontes software class"; }
+describe_set_parameters() { echo "<class>"; }
+do_unset() {
+	local class=""
+	local a
+
+	for a in $@; do
+		[ "${a}" == "--install" ] && INSTALL=1
+		if is_class ${a}; then
+			class="${a}"
+		fi
+	done
+	
+	[ -z "${class}" ] && die -q "No class specified."
+
+	if ! is_current ${class} && [[ ${INSTALL} -eq 0 ]]; then
+		echo "${class} is not currently set."
+		return 0
+	fi
+
+	unset_class "${class}"
+}
+
+
+#
+# Add function
+#
+# Pretty much stolen from skel.bash
+
+describe_add() { echo "Add a new Brontes software class"; }
+describe_add_parameters() { echo "<file>"; }
+do_add() {
+	local class
+	[[ ${#@} -ne 1 ]] \
+		&& die -q "Bad arguments, use:  eselect brontes add <file>"
+	
+    # If $D is set, we're adding from portage so we want to respect sandbox.
+    # Otherwise, respect the ROOT variable.
+    local PREFIX=${D:-${ROOT}/}
+
+    # Create directory if necessary
+    if [ ! -e ${PREFIX}/etc/env.d/brontes/ ]; then
+        mkdir -p ${PREFIX}/etc/env.d/brontes/
+    else
+        if [[ ! -d ${PREFIX}/etc/env.d/brontes/ ]]; then
+            die -q "${PREFIX}/etc/env.d/brontes/ exists but isn't a directory!"
+        fi
+    fi
+
+    class=$(basename ${1}); class=${class%.eselect}
+    if ! cp ${1} ${PREFIX}/etc/env.d/brontes/${class}; then
+        die -q "Installing ${1} as ${PREFIX}/etc/env.d/brontes/${class} failed!"
+    fi
+}
+
+
+#
+# Show function
+#
+describe_show() { echo "Show the current active Brontes software class"; }
+do_show() {	
+	echo "current: $(get_current_class)";
+}
+# vim: set ft=eselect :
